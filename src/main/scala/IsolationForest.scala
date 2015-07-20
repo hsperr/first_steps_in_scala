@@ -5,50 +5,82 @@ import org.apache.spark.mllib.tree.RandomForest
 import org.apache.spark.rdd.RDD
 import org.apache.spark.{SparkContext, SparkConf}
 
+import scala.collection.mutable
 import scala.util.Random
 
 trait ITree;
-class innerNode(left:ITree, right:ITree, split_column:Int, split_value:Double) extends ITree
-class exNode(size:Long) extends ITree
+class innerNode(val left:ITree, val right:ITree, val split_column:Int, val split_value:Double) extends ITree
+class exNode(val size:Long) extends ITree
 
 class IsolationForest(numTrees:Int = 2,
                       subSampleSize:Int = 256,
                       seed: Long = Random.nextLong) {
 
   val height_limit = math.ceil(math.log(subSampleSize)).toInt
+  val iTrees = new mutable.MutableList[ITree]();
+  var num_samples = 0L;
 
   def fit(data: RDD[Array[Double]]): Unit ={
+    //TODO: parallelize
+    num_samples=data.count()
     for(t<-1 to numTrees){
-      val sample = data.sample(false, subSampleSize/data.count(), seed=seed)
+      println("Subsample "+(subSampleSize/data.count().toDouble))
+      val sample = data.sample(false, subSampleSize/data.count().toDouble, seed=seed)
       val tree = grow_tree(sample, 0)
+      iTrees += tree
+    }
+  }
+
+  def predict(x:Array[Double]): Double ={
+    val predictions = iTrees.map(s=>pathLength(x, s, 0)).toList
+    println(predictions.mkString(" "))
+    math.pow(2, -(predictions.sum/predictions.size)/cost(num_samples))
+  }
+
+  def cost(num_items:Long): Int = (2*(math.log(num_items-1)+0.5772156649)-(2*(num_items-1)/num_items)).toInt
+
+  def pathLength(x:Array[Double], tree:ITree, path_length:Int): Double ={
+    tree match{
+      case x: exNode => if(x.size>1) path_length + cost(x.size)
+                        else path_length+1
+
+      case y: innerNode =>{
+        val split_column = y.split_column
+        val split_value = y.split_value
+        val sample_value = x(split_column)
+
+        if(sample_value<split_value){
+          return pathLength(x, y.left, path_length+1)
+        }
+        pathLength(x, y.right, path_length+1)
+      }
     }
   }
 
   def grow_tree(X:RDD[Array[Double]], currentHeight:Int): ITree ={
     val num_samples = X.count()
+    println("Growing", num_samples)
     if(currentHeight>=height_limit || num_samples<=1){
       return new exNode(num_samples)
     }
-    val split_column = Random.nextInt(X.take(0).size)
-    println(split_column)
+    println("num_columns "+X.take(1)(0).length)
+    val split_column = Random.nextInt(X.take(1)(0).length)
     val column = X.map(s=>s(split_column))
-    println(column)
 
     val col_min = column.min()
     val col_max = column.max()
-    println(col_min)
-    println(col_max)
 
     val split_value = col_min+Random.nextDouble()*(col_max-col_min)
-    println(split_value)
+    assert(col_min<=split_value)
+    assert(split_value<=col_max)
 
     val X_left = X.filter(s=>s(split_column)<split_value)
     val X_right = X.filter(s=>s(split_column)>=split_value)
 
-    return new innerNode(grow_tree(X_left, currentHeight+1),
-                     grow_tree(X_right, currentHeight+1),
-                     split_column,
-                     split_value)
+    new innerNode(grow_tree(X_left, currentHeight+1),
+                  grow_tree(X_right, currentHeight+1),
+                  split_column,
+                  split_value)
   }
 }
 
@@ -76,8 +108,9 @@ object Runner{
     //val points = rows.map(s=>LabeledPoint(s(0), Vectors.dense(s.slice(1, s.length))))
     val vecs = rows.map(s=>LabeledPoint(s(0), Vectors.dense(s.slice(1, s.length))))
 
-    val forest = new IsolationForest()
+    val forest = new IsolationForest(numTrees = 2)
     forest.fit(rows.map(s=>s.slice(1, s.length)))
+    println("ForestScore"+forest.predict(rows.take(100)(99)))
 
     println("Finished Isolation")
 
