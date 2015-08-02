@@ -8,9 +8,10 @@ import org.apache.spark.{SparkContext, SparkConf}
 import scala.collection.mutable
 import scala.util.Random
 
-trait ITree;
-class innerNode(val left:ITree, val right:ITree, val split_column:Int, val split_value:Double) extends ITree
-class exNode(val size:Long) extends ITree
+sealed trait ITree
+case class innerNode(left:ITree, right:ITree, split_column:Int, split_value:Double) extends ITree
+case class exNode(size:Long) extends ITree
+
 
 class IsolationForest(numTrees:Int = 2,
                       subSampleSize:Int = 256,
@@ -20,7 +21,7 @@ class IsolationForest(numTrees:Int = 2,
   val iTrees = new mutable.MutableList[ITree]();
   var num_samples = 0L;
 
-  def fit(data: RDD[Array[Double]]): Unit ={
+  def fit(data: RDD[Array[Double]]): Unit = {
     //TODO: parallelize
     num_samples=data.count()
     for(t<-1 to numTrees){
@@ -29,53 +30,52 @@ class IsolationForest(numTrees:Int = 2,
       val tree = grow_tree(sample, 0)
       iTrees += tree
     }
+    println("NumSamples", num_samples)
   }
 
-  def predict(x:Array[Double]): Double ={
+  def predict(x:Array[Double]): Double = {
     val predictions = iTrees.map(s=>pathLength(x, s, 0)).toList
     println(predictions.mkString(" "))
+    println(cost(num_samples))
     math.pow(2, -(predictions.sum/predictions.size)/cost(num_samples))
   }
 
-  def cost(num_items:Long): Int = (2*(math.log(num_items-1)+0.5772156649)-(2*(num_items-1)/num_items)).toInt
+  def cost(num_items:Long): Int =
+    (2*(math.log(num_items-1)+0.5772156649)-(2*(num_items-1)/num_items)).toInt
 
-  def pathLength(x:Array[Double], tree:ITree, path_length:Int): Double ={
+  @scala.annotation.tailrec
+  final def pathLength(x:Array[Double], tree:ITree, path_length:Int): Double ={
     tree match{
-      case x: exNode => if(x.size>1) path_length + cost(x.size)
-                        else path_length+1
+      case exNode(size) =>
+        if (size > 1) path_length + cost(size)
+        else path_length + 1
 
-      case y: innerNode =>{
-        val split_column = y.split_column
-        val split_value = y.split_value
+      case innerNode(left, right, split_column, split_value) =>
         val sample_value = x(split_column)
 
-        if(sample_value<split_value){
-          return pathLength(x, y.left, path_length+1)
-        }
-        pathLength(x, y.right, path_length+1)
-      }
+        if (sample_value < split_value)
+          pathLength(x, left, path_length+1)
+        else
+          pathLength(x, right, path_length+1)
     }
   }
 
   def grow_tree(X:RDD[Array[Double]], currentHeight:Int): ITree ={
     val num_samples = X.count()
-    println("Growing", num_samples)
+    println("Growing ", num_samples, "Height ", currentHeight, "Maxheight", height_limit)
     if(currentHeight>=height_limit || num_samples<=1){
       return new exNode(num_samples)
     }
-    println("num_columns "+X.take(1)(0).length)
-    val split_column = Random.nextInt(X.take(1)(0).length)
+    val split_column = Random.nextInt(10)
     val column = X.map(s=>s(split_column))
 
     val col_min = column.min()
     val col_max = column.max()
 
     val split_value = col_min+Random.nextDouble()*(col_max-col_min)
-    assert(col_min<=split_value)
-    assert(split_value<=col_max)
 
-    val X_left = X.filter(s=>s(split_column)<split_value)
-    val X_right = X.filter(s=>s(split_column)>=split_value)
+    val X_left = X.filter(s=>s(split_column)<split_value).cache()
+    val X_right = X.filter(s=>s(split_column)>=split_value).cache()
 
     new innerNode(grow_tree(X_left, currentHeight+1),
                   grow_tree(X_right, currentHeight+1),
@@ -86,8 +86,10 @@ class IsolationForest(numTrees:Int = 2,
 
 object Runner{
   def main(args:Array[String]): Unit ={
+    Random.setSeed(1337)
+
     val conf = new SparkConf()
-      .setMaster("local[2]")
+      .setMaster("local[3]")
       .setAppName("IsolationTree")
       .set("spark.executor.memory", "1g")
       .set("spark.rdd.compress", "true")
@@ -96,7 +98,12 @@ object Runner{
     val sc = new SparkContext(conf)
     val lines = sc.textFile("src/main/resources/cs-training.csv")
 
-    val data = lines.map(line=>line.replace("NA", "-1.0")).map(line => line.split(",").map(elem => elem.trim)).map(s=>s.slice(1,s.length)) //lines in rows
+    val data =
+      lines
+        .map(line=>line.replace("NA", "-1.0"))
+        .map(line => line.split(",")
+        .map(elem => elem.trim))
+        .map(s=>s.slice(1,s.length)) //lines in rows
     val header = new SimpleCSVHeader(data.take(1)(0)) // we build our header with the first line
     val rows = data.filter(line => line(0) != header.getColumn(0) ).map(s=>s.map(_.toDouble)) // filter the header out and first row
 
@@ -108,30 +115,49 @@ object Runner{
     //val points = rows.map(s=>LabeledPoint(s(0), Vectors.dense(s.slice(1, s.length))))
     val vecs = rows.map(s=>LabeledPoint(s(0), Vectors.dense(s.slice(1, s.length))))
 
-    val forest = new IsolationForest(numTrees = 2)
+    val forest = new IsolationForest(numTrees = 50)
     forest.fit(rows.map(s=>s.slice(1, s.length)))
-    println("ForestScore"+forest.predict(rows.take(100)(99)))
-
+    val local_rows = rows.take(100)
+    for(row <- local_rows){
+      println("ForestScore", forest.predict(row.slice(1, row.length)), "Label", row(0))
+    }
     println("Finished Isolation")
 
-    val splits = vecs.randomSplit(Array(0.8, 0.2), seed=1337)
-    val training = splits(0).cache()
-    val test = splits(1).cache()
+//  val splits = vecs.randomSplit(Array(0.8, 0.2), seed=1337)
+//  val training = splits(0).cache()
+//  val test = splits(1).cache()
 
 
-    val model = RandomForest.trainClassifier(training, 2, Map[Int, Int](), 250, "auto", "gini", 5, 32)
-    val scoreAndLabels = test.map({ point =>
-      val score = model.predict(point.features)
-      (score, point.label)
-    })
+//  val model = RandomForest.trainClassifier(training, 2, Map[Int, Int](), 250, "auto", "gini", 5, 32)
+//  val scoreAndLabels = test.map({ point =>
+//    val score = model.predict(point.features)
+//    (score, point.label)
+//  })
 
-    val metrics = new BinaryClassificationMetrics(scoreAndLabels)
-    val auROC = metrics.areaUnderROC()
-    println("Area under ROC = "+auROC)
+//  val metrics = new BinaryClassificationMetrics(scoreAndLabels)
+//  val auROC = metrics.areaUnderROC()
+//  println("Area under ROC = "+auROC)
 
   }
 
 }
+
+/*trait TextOps
+
+trait CsvOps {
+
+  def lines(filname: String): RDD[String]
+
+  def lines(filename: String)(implicit sc: SparkContext): Array[String] = {
+    sc.textFile(filename)
+      .map(line => line.split(","))
+  }
+
+  lines("test").map()
+
+}
+
+object CsvOps extends CsvOps*/
 
 class SparkCSV(sc:SparkContext,
                filename:String,
