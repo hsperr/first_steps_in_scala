@@ -1,14 +1,13 @@
 /**
  * Created by henning.sperr on 7/29/15.
  */
-import Stream._
 
 trait Stream[+A] {
   def uncons: Option[(A, Stream[A])]
-  def isEmpty: Boolean = uncons.isEmpty
+  def isEmpty: Boolean = false
 
   def toList[A]: List[A] = {
-    uncons
+    List()
   }
 }
 

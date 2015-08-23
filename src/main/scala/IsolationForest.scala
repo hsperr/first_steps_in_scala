@@ -1,42 +1,18 @@
-import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.RandomForest
 import org.apache.spark.rdd.RDD
-import org.apache.spark.{SparkContext, SparkConf}
+import org.apache.spark.{SparkConf, SparkContext}
 
-import scala.collection.mutable
 import scala.util.Random
 
 sealed trait ITree
-case class innerNode(left:ITree, right:ITree, split_column:Int, split_value:Double) extends ITree
-case class exNode(size:Long) extends ITree
+case class ITreeBranch(left: ITree, right: ITree, split_column: Int, split_value: Double) extends ITree
+case class ITreeLeaf(size: Long) extends ITree
 
-
-class IsolationForest(numTrees:Int = 2,
-                      subSampleSize:Int = 256,
-                      seed: Long = Random.nextLong) {
-
-  val height_limit = math.ceil(math.log(subSampleSize)).toInt
-  val iTrees = new mutable.MutableList[ITree]();
-  var num_samples = 0L;
-
-  def fit(data: RDD[Array[Double]]): Unit = {
-    //TODO: parallelize
-    num_samples=data.count()
-    for(t<-1 to numTrees){
-      println("Subsample "+(subSampleSize/data.count().toDouble))
-      val sample = data.sample(false, subSampleSize/data.count().toDouble, seed=seed)
-      val tree = grow_tree(sample, 0)
-      iTrees += tree
-    }
-    println("NumSamples", num_samples)
-  }
-
+case class IsolationForest(num_samples: Long, trees: Array[ITree]) {
   def predict(x:Array[Double]): Double = {
-    val predictions = iTrees.map(s=>pathLength(x, s, 0)).toList
-    println(predictions.mkString(" "))
-    println(cost(num_samples))
+    val predictions = trees.map(s=>pathLength(x, s, 0)).toList
+    println(predictions.mkString(","))
     math.pow(2, -(predictions.sum/predictions.size)/cost(num_samples))
   }
 
@@ -46,11 +22,13 @@ class IsolationForest(numTrees:Int = 2,
   @scala.annotation.tailrec
   final def pathLength(x:Array[Double], tree:ITree, path_length:Int): Double ={
     tree match{
-      case exNode(size) =>
+      case ITreeLeaf(size) =>
+        println("Size: "+size+" path_lenth: "+path_length)
         if (size > 1) path_length + cost(size)
         else path_length + 1
 
-      case innerNode(left, right, split_column, split_value) =>
+      case ITreeBranch(left, right, split_column, split_value) =>
+        println("Column:"+split_column+" split_value: "+split_value)
         val sample_value = x(split_column)
 
         if (sample_value < split_value)
@@ -59,30 +37,50 @@ class IsolationForest(numTrees:Int = 2,
           pathLength(x, right, path_length+1)
     }
   }
+}
 
-  def grow_tree(X:RDD[Array[Double]], currentHeight:Int): ITree ={
-    val num_samples = X.count()
-    println("Growing ", num_samples, "Height ", currentHeight, "Maxheight", height_limit)
-    if(currentHeight>=height_limit || num_samples<=1){
-      return new exNode(num_samples)
+object IsolationForest {
+
+  def getRandomSubsample(data: RDD[Array[Double]], sampleRatio: Double, seed: Long = Random.nextLong): RDD[Array[Double]] = {
+    data.sample(false, sampleRatio, seed=seed)
+  }
+
+  def buildForest(data: RDD[Array[Double]], numTrees: Int = 2, subSampleSize: Int = 256, seed: Long = Random.nextLong) : IsolationForest = {
+    val numSamples = data.count()
+    val numColumns = data.take(1)(0).size
+    val maxHeight = math.ceil(math.log(subSampleSize)).toInt
+    val trees = Array.fill[ITree](numTrees)(ITreeLeaf(1))
+
+    val trainedTrees = trees.map(s=>growTree(getRandomSubsample(data, subSampleSize/numSamples.toDouble, seed), maxHeight, numColumns))
+
+    IsolationForest(numSamples, trainedTrees)
+  }
+
+  def growTree(data: RDD[Array[Double]], maxHeight:Int, numColumns:Int, currentHeight:Int = 0): ITree = {
+    val numSamples = data.count()
+    if(currentHeight>=maxHeight || numSamples <= 1){
+      return new ITreeLeaf(numSamples)
     }
-    val split_column = Random.nextInt(10)
-    val column = X.map(s=>s(split_column))
+
+    val split_column = Random.nextInt(numColumns)
+    val column = data.map(s=>s(split_column))
 
     val col_min = column.min()
     val col_max = column.max()
-
     val split_value = col_min+Random.nextDouble()*(col_max-col_min)
 
-    val X_left = X.filter(s=>s(split_column)<split_value).cache()
-    val X_right = X.filter(s=>s(split_column)>=split_value).cache()
+    val X_left = data.filter(s=>s(split_column) < split_value).cache()
+    val X_right = data.filter(s=>s(split_column) >= split_value).cache()
 
-    new innerNode(grow_tree(X_left, currentHeight+1),
-                  grow_tree(X_right, currentHeight+1),
+    println("COLUMN: "+split_column+"MIN: "+col_min+" MAX: "+col_max+" SPLIT VALUE: "+split_value+" LEFTSIZE: "+X_left.count()+" RIGHTSIZE: "+X_right.count())
+
+    new ITreeBranch(growTree(X_left, maxHeight, numColumns, currentHeight+1),
+                  growTree(X_right, maxHeight, numColumns, currentHeight+1),
                   split_column,
                   split_value)
   }
 }
+
 
 object Runner{
   def main(args:Array[String]): Unit ={
@@ -115,8 +113,8 @@ object Runner{
     //val points = rows.map(s=>LabeledPoint(s(0), Vectors.dense(s.slice(1, s.length))))
     val vecs = rows.map(s=>LabeledPoint(s(0), Vectors.dense(s.slice(1, s.length))))
 
-    val forest = new IsolationForest(numTrees = 50)
-    forest.fit(rows.map(s=>s.slice(1, s.length)))
+    val forest = IsolationForest.buildForest(rows, 2)
+
     val local_rows = rows.take(100)
     for(row <- local_rows){
       println("ForestScore", forest.predict(row.slice(1, row.length)), "Label", row(0))
@@ -156,22 +154,7 @@ trait CsvOps {
   lines("test").map()
 
 }
-
-object CsvOps extends CsvOps*/
-
-class SparkCSV(sc:SparkContext,
-               filename:String,
-               has_header:Boolean = true,
-               sep:String = ",",
-               na_fill_value:String="-1.0",
-                drop_columns: List[Int] = Nil){
-
-  val lines = sc.textFile(filename)
-  val data = lines.map(line => line.split(sep).map(elem => elem.replace("NA", na_fill_value).trim))
-
-  val header = new SimpleCSVHeader(data.take(1)(0))
-  val rows = data.filter(line => header(line,0) != line(0)).map(s=>s.map(_.toDouble))
-}
+*/
 
 class SimpleCSVHeader(header:Array[String]) extends Serializable {
   val name2column = header.zipWithIndex.toMap
